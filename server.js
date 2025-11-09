@@ -1,5 +1,6 @@
 import express from 'express'
 import 'dotenv/config'
+import fs from 'fs'
 import { fundWallet } from './fund-wallet.js'
 import { processDisbursement } from './disbursement.js'
 import { createAuthenticatedClient, isFinalizedGrant } from '@interledger/open-payments'
@@ -7,7 +8,6 @@ import { createAuthenticatedClient, isFinalizedGrant } from '@interledger/open-p
 const app = express()
 app.use(express.json())
 
-// Configuration from environment variables
 const DEFAULT_CONFIG = {
   privateKeyPath: 'general-test-private.key',
   keyId: 'b4fe7d1d-76bc-4290-b280-eba1f3021b9f',
@@ -15,27 +15,59 @@ const DEFAULT_CONFIG = {
   sendingWalletAddressUrl: 'https://ilp.interledger-test.dev/388aba51'
 }
 
-// POST /kanzu/fund-wallet - Gets authorization for pool
+// Simple in-memory storage for grants (or use a JSON file)
+const grants = new Map()
+
+// Helper to save grants to file (persists across restarts)
+function saveGrants() {
+  fs.writeFileSync('grants.json', JSON.stringify(Array.from(grants.entries())))
+}
+
+function loadGrants() {
+  if (fs.existsSync('grants.json')) {
+    const data = JSON.parse(fs.readFileSync('grants.json', 'utf8'))
+    data.forEach(([key, value]) => grants.set(key, value))
+    console.log(`📂 Loaded ${grants.size} grants from storage`)
+  }
+}
+
+// Load grants on startup
+loadGrants()
+
+// POST /kanzu/fund-wallet
 app.post('/kanzu/fund-wallet', async (req, res) => {
   try {
     const { fromWallet, toWallet, transactionAmount, poolId } = req.body
 
-    console.log('📥 Fund wallet request')
-    console.log('   Pool ID:', poolId)
-    console.log('   Amount: $' + (transactionAmount / 100).toFixed(2))
+    console.log('📥 Fund wallet request for pool:', poolId)
 
-    const wordpressUrl = process.env.WORDPRESS_BASE_URL
-    const callbackUrl = `${wordpressUrl}/wp-admin/admin.php?page=shabaha-pools&auth_complete=1&pool_id=${poolId}`
+    // Callback goes to SERVICE (not WordPress)
+    const serviceUrl = process.env.SERVICE_URL || `http://localhost:${PORT}`
+    const callbackUrl = `${serviceUrl}/kanzu/grant-callback?pool_id=${poolId}`
 
     const result = await fundWallet({
       ...DEFAULT_CONFIG,
-      //sendingWalletAddressUrl: fromWallet, //@TODO Don't allow this override
+      sendingWalletAddressUrl: fromWallet,
       receivingWalletAddressUrl: toWallet,
       amount: transactionAmount,
       callbackUrl: callbackUrl
     })
 
-    console.log('✅ Fund wallet successful')
+    // Store grant info
+    grants.set(poolId.toString(), {
+      continueUri: result.grant.continue.uri,
+      continueAccessToken: result.grant.continue.access_token.value,
+      sendingWalletAddress: fromWallet,
+      receivingWalletAddress: toWallet,
+      poolId: poolId,
+      isAuthorized: false,  // Not yet authorized
+      createdAt: new Date().toISOString()
+    })
+    
+    saveGrants()
+    
+    console.log(`✅ Grant stored for pool ${poolId}`)
+
     res.json(result)
   } catch (error) {
     console.error('❌ Fund wallet error:', error)
@@ -46,66 +78,62 @@ app.post('/kanzu/fund-wallet', async (req, res) => {
   }
 })
 
-// POST /kanzu/finalize-grant - Finalizes grant after funder authorization
-app.post('/kanzu/finalize-grant', async (req, res) => {
+// GET /kanzu/grant-callback - Interledger redirects here after authorization
+app.get('/kanzu/grant-callback', async (req, res) => {
   try {
-    const { continueUri, continueAccessToken } = req.body
+    const { interact_ref, pool_id } = req.query  // Get interact_ref from callback
 
-    console.log('📥 Finalize grant request')
-    console.log('   Continue URI:', continueUri)
-
-    const client = await createAuthenticatedClient({
-      walletAddressUrl: DEFAULT_CONFIG.clientWalletAddressUrl,
-      keyId: DEFAULT_CONFIG.keyId,
-      privateKey: DEFAULT_CONFIG.privateKeyPath
-    })
-
-    // Continue the grant to get finalized access token
-    const finalizedGrant = await client.grant.continue({
-      url: continueUri,
-      accessToken: continueAccessToken
-    })
-
-    if (!isFinalizedGrant(finalizedGrant)) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Grant is not finalized yet'
-      })
+    console.log('📥 Grant callback - Authorization complete')
+    console.log('   Pool ID:', pool_id)
+    
+    const grantInfo = grants.get(pool_id.toString())
+    
+    if (!grantInfo) {
+      return res.status(404).send('Grant not found')
     }
 
-    console.log('✅ Grant finalized successfully')
+    // STORE the interact_ref
+    grantInfo.interact_ref = interact_ref
+    grantInfo.isAuthorized = true
+    grants.set(pool_id.toString(), grantInfo)
+    saveGrants()
 
-    res.json({
-      status: 'success',
-      access_token: finalizedGrant.access_token.value,
-      message: 'Grant finalized successfully'
-    })
+    console.log('✅ Authorization captured')
+
+    // Redirect to WordPress
+    const wordpressUrl = process.env.WORDPRESS_BASE_URL
+    res.redirect(`${wordpressUrl}/wp-admin/admin.php?page=shabaha-pools&auth_complete=1&pool_id=${pool_id}`)
   } catch (error) {
-    console.error('❌ Finalize grant error:', error)
-    res.status(500).json({
-      status: 'error',
-      message: error.message
-    })
+    console.error('❌ Callback error:', error)
+    res.status(500).send('Error: ' + error.message)
   }
 })
+
+// POST /kanzu/disbursement
 app.post('/kanzu/disbursement', async (req, res) => {
   try {
-    const {
-      continueAccessToken, // This is now the FINALIZED token
-      studentWalletAddress,
-      debitAmount,
-      id,
-      StudentName
-    } = req.body
+    const { studentWalletAddress, debitAmount, id, StudentName, poolId } = req.body
 
     console.log('📥 Disbursement request')
     console.log('   Transaction ID:', id)
     console.log('   Student:', StudentName)
-    console.log('   Amount: $' + (debitAmount / 100).toFixed(2))
+    const grantInfo = grants.get(poolId.toString())
+    
+    if (!grantInfo) {
+      throw new Error(`Grant not found for pool ${poolId}`)
+    }
+
+    if (!grantInfo.isAuthorized || !grantInfo.interact_ref) {
+      throw new Error('Pool not authorized yet. Please authorize first.')
+    }
+
+    console.log(`✓ Using authorized grant from pool ${poolId}`)
 
     const result = await processDisbursement({
       ...DEFAULT_CONFIG,
-      finalizedAccessToken: continueAccessToken, // Pass as finalized token
+      continueUri: grantInfo.continueUri,
+      continueAccessToken: grantInfo.continueAccessToken,
+      interact_ref: grantInfo.interact_ref,  // Pass interact_ref
       studentWalletAddressUrl: studentWalletAddress,
       amount: parseInt(debitAmount)
     })

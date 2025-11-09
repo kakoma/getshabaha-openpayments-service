@@ -37,30 +37,114 @@ export async function fundWallet(config) {
 
   console.log('✓ Step 1: Got wallet addresses')
 
-  // Step 2: Request outgoing payment grant for the TOTAL pool amount
-  // This grant will be used for multiple student disbursements
-  const grantRequest = {
-    access_token: {
-      access: [
-        {
-          type: 'outgoing-payment',
-          actions: ['read', 'create', 'list'],
-          limits: {
-            debitAmount: {
-              assetCode: sendingWalletAddress.assetCode,
-              assetScale: sendingWalletAddress.assetScale,
-              value: amount.toString() // Total pool amount
-            }
-          },
-          identifier: sendingWalletAddress.id
-        }
-      ]
+  // Step 2: Get incoming payment grant
+  const incomingPaymentGrant = await client.grant.request(
+    {
+      url: receivingWalletAddress.authServer
     },
-    interact: {
-      start: ['redirect']
+    {
+      access_token: {
+        access: [
+          {
+            type: 'incoming-payment',
+            actions: ['read', 'complete', 'create']
+          }
+        ]
+      }
     }
+  )
+
+  if (!isFinalizedGrant(incomingPaymentGrant)) {
+    throw new Error('Expected finalized incoming payment grant')
   }
 
+  console.log('✓ Step 2: Got incoming payment grant')
+
+  // Step 3: Create incoming payment
+  const incomingPayment = await client.incomingPayment.create(
+    {
+      url: receivingWalletAddress.resourceServer,
+      accessToken: incomingPaymentGrant.access_token.value
+    },
+    {
+      walletAddress: receivingWalletAddress.id,
+      incomingAmount: {
+        assetCode: receivingWalletAddress.assetCode,
+        assetScale: receivingWalletAddress.assetScale,
+        value: amount.toString()
+      }
+    }
+  )
+
+  console.log('✓ Step 3: Created incoming payment')
+
+  // Step 4: Get quote grant
+  const quoteGrant = await client.grant.request(
+    {
+      url: sendingWalletAddress.authServer
+    },
+    {
+      access_token: {
+        access: [
+          {
+            type: 'quote',
+            actions: ['create', 'read']
+          }
+        ]
+      }
+    }
+  )
+
+  if (!isFinalizedGrant(quoteGrant)) {
+    throw new Error('Expected finalized quote grant')
+  }
+
+  console.log('✓ Step 4: Got quote grant')
+
+  // Step 5: Create quote
+  const quote = await client.quote.create(
+    {
+      url: sendingWalletAddress.resourceServer,
+      accessToken: quoteGrant.access_token.value
+    },
+    {
+      walletAddress: sendingWalletAddress.id,
+      receiver: incomingPayment.id,
+      method: 'ilp'
+    }
+  )
+
+  console.log('✓ Step 5: Created quote')
+
+ // Step 6: Request outgoing payment grant (interactive)
+  // Step 6: Request outgoing payment grant (interactive)
+const grantRequest = {
+  access_token: {
+    access: [
+      {
+        type: 'outgoing-payment',
+        actions: ['read', 'create', 'list'],
+        limits: {
+          debitAmount: {
+            assetCode: sendingWalletAddress.assetCode,
+            assetScale: sendingWalletAddress.assetScale,
+            value: amount.toString()
+          }
+        },
+        identifier: sendingWalletAddress.id
+      }
+    ]
+  },
+  interact: {
+    start: ['redirect'],
+    finish: {
+      method: 'redirect',
+      uri: callbackUrl,  // Service callback URL
+      nonce: crypto.randomUUID()
+    }
+  }
+}
+  
   // Add finish callback if provided
   if (callbackUrl) {
     try {
