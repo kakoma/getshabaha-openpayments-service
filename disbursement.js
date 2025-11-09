@@ -1,6 +1,6 @@
 /**
  * Disbursement Script - Run when student claims points
- * Uses stored grant info to finalize and create outgoing payment
+ * Creates incoming payment and quote, then uses stored grant for outgoing payment
  */
 
 import {
@@ -15,8 +15,9 @@ export async function processDisbursement(config) {
     keyId,
     clientWalletAddressUrl,
     sendingWalletAddressUrl,
-    continueUri,
-    continueAccessToken
+    studentWalletAddressUrl,
+    amount,
+    finalizedAccessToken // Changed from continueUri/continueAccessToken
   } = config
 
   const client = await createAuthenticatedClient({
@@ -25,73 +26,131 @@ export async function processDisbursement(config) {
     privateKey: privateKeyPath
   })
 
-  console.log('✓ Got sending wallet address')
+  console.log('🎯 Starting disbursement for student')
+  console.log('   Amount: $' + (amount / 100).toFixed(2))
 
-  // Step 7: Continue the grant (finalize it)
-  let finalizedOutgoingPaymentGrant
-
-  try {
-    console.log('🔄 Continuing grant...')
-    console.log('   URI:', continueUri)
-    
-    finalizedOutgoingPaymentGrant = await client.grant.continue({
-      url: continueUri,
-      accessToken: continueAccessToken
-    })
-  } catch (err) {
-    console.error('Grant continuation error:', err)
-    
-    if (err instanceof OpenPaymentsClientError) {
-      throw new Error(
-        'Grant continuation failed. The funder authorization may have expired or been already used. Please create a new funding pool.'
-      )
-    }
-    throw err
-  }
-
-  if (!isFinalizedGrant(finalizedOutgoingPaymentGrant)) {
-    throw new Error('Grant is not finalized. Funder must authorize first.')
-  }
-
-  console.log('✓ Finalized outgoing payment grant')
-
-  // Get the wallet address and quote from the finalized grant
+  // Step 1: Get wallet addresses
   const sendingWalletAddress = await client.walletAddress.get({
     url: sendingWalletAddressUrl
   })
-
-  // The quote ID should be in the finalized grant
-  const quoteId = finalizedOutgoingPaymentGrant.access_token.access[0]?.limits?.receiver || null
   
-  if (!quoteId) {
-    console.error('Finalized grant:', finalizedOutgoingPaymentGrant)
-    throw new Error('Quote ID not found in finalized grant')
-  }
+  const studentWalletAddress = await client.walletAddress.get({
+    url: studentWalletAddressUrl
+  })
 
-  console.log('✓ Got quote ID from grant:', quoteId)
+  console.log('✓ Step 1: Got wallet addresses')
 
-  // Step 7c: Create outgoing payment
-  const outgoingPayment = await client.outgoingPayment.create(
+  // NO LONGER NEED TO FINALIZE - we already have the finalized token!
+  // Just use it directly
+
+  // Step 2: Get incoming payment grant for student
+  const incomingPaymentGrant = await client.grant.request(
     {
-      url: sendingWalletAddress.resourceServer,
-      accessToken: finalizedOutgoingPaymentGrant.access_token.value
+      url: studentWalletAddress.authServer
     },
     {
-      walletAddress: sendingWalletAddress.id,
-      quoteId: quoteId
+      access_token: {
+        access: [
+          {
+            type: 'incoming-payment',
+            actions: ['read', 'complete', 'create']
+          }
+        ]
+      }
     }
   )
 
-  console.log('✓ Created outgoing payment - funds transferred!')
+  if (!isFinalizedGrant(incomingPaymentGrant)) {
+    throw new Error('Expected finalized incoming payment grant')
+  }
+
+  console.log('✓ Step 2: Got incoming payment grant for student')
+
+  // Step 3: Create incoming payment
+  const incomingPayment = await client.incomingPayment.create(
+    {
+      url: studentWalletAddress.resourceServer,
+      accessToken: incomingPaymentGrant.access_token.value
+    },
+    {
+      walletAddress: studentWalletAddress.id,
+      incomingAmount: {
+        assetCode: studentWalletAddress.assetCode,
+        assetScale: studentWalletAddress.assetScale,
+        value: amount.toString()
+      },
+      metadata: {
+        description: 'Shabaha learning reward'
+      }
+    }
+  )
+
+  console.log('✓ Step 3: Created incoming payment')
+
+  // Step 4: Get quote grant
+  const quoteGrant = await client.grant.request(
+    {
+      url: sendingWalletAddress.authServer
+    },
+    {
+      access_token: {
+        access: [
+          {
+            type: 'quote',
+            actions: ['create', 'read']
+          }
+        ]
+      }
+    }
+  )
+
+  if (!isFinalizedGrant(quoteGrant)) {
+    throw new Error('Expected finalized quote grant')
+  }
+
+  console.log('✓ Step 4: Got quote grant')
+
+  // Step 5: Create quote
+  const quote = await client.quote.create(
+    {
+      url: sendingWalletAddress.resourceServer,
+      accessToken: quoteGrant.access_token.value
+    },
+    {
+      walletAddress: sendingWalletAddress.id,
+      receiver: incomingPayment.id,
+      method: 'ilp'
+    }
+  )
+
+  console.log('✓ Step 5: Created quote')
+
+  // Step 6: Create outgoing payment using the FINALIZED access token
+  const outgoingPayment = await client.outgoingPayment.create(
+    {
+      url: sendingWalletAddress.resourceServer,
+      accessToken: finalizedAccessToken // Use the stored finalized token
+    },
+    {
+      walletAddress: sendingWalletAddress.id,
+      quoteId: quote.id,
+      metadata: {
+        description: 'Shabaha disbursement'
+      }
+    }
+  )
+
+  console.log('✓ Step 6: Created outgoing payment - funds transferred!')
 
   return {
     status: 'success',
     disbursementId: outgoingPayment.id,
     outgoingPaymentId: outgoingPayment.id,
+    incomingPaymentId: incomingPayment.id,
+    quoteId: quote.id,
     message: 'Payment completed successfully'
   }
 }
-
 // If running directly (not imported)
 if (import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
