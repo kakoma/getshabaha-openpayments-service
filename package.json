@@ -1,0 +1,15 @@
+{
+  "name": "shabaha-interledger-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "fund": "node fund-wallet.js",
+    "disburse": "node disbursement.js"
+  },
+  "dependencies": {
+    "@interledger/open-payments": "^7.1.3",
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2"
+  }
+}
