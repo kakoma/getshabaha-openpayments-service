@@ -7,6 +7,7 @@ import {
   createAuthenticatedClient,
   isFinalizedGrant
 } from '@interledger/open-payments'
+import crypto from 'crypto'
 
 export async function fundWallet(config) {
   const {
@@ -115,27 +116,33 @@ export async function fundWallet(config) {
   console.log('✓ Step 5: Created quote')
 
  // Step 6: Request outgoing payment grant (interactive)
-  const grantRequest = {
-    access_token: {
-      access: [
-        {
-          type: 'outgoing-payment',
-          actions: ['read', 'create'],
-          limits: {
-            debitAmount: {
-              assetCode: quote.debitAmount.assetCode,
-              assetScale: quote.debitAmount.assetScale,
-              value: quote.debitAmount.value
-            }
-          },
-          identifier: sendingWalletAddress.id
-        }
-      ]
-    },
-    interact: {
-      start: ['redirect']
+  // Step 6: Request outgoing payment grant (interactive)
+const grantRequest = {
+  access_token: {
+    access: [
+      {
+        type: 'outgoing-payment',
+        actions: ['read', 'create', 'list'],
+        limits: {
+          debitAmount: {
+            assetCode: sendingWalletAddress.assetCode,
+            assetScale: sendingWalletAddress.assetScale,
+            value: amount.toString()
+          }
+        },
+        identifier: sendingWalletAddress.id
+      }
+    ]
+  },
+  interact: {
+    start: ['redirect'],
+    finish: {
+      method: 'redirect',
+      uri: callbackUrl,  // Service callback URL
+      nonce: crypto.randomUUID()
     }
   }
+}
   
   // Add finish callback if provided
   if (callbackUrl) {

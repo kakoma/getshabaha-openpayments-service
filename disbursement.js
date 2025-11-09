@@ -1,8 +1,6 @@
 /**
- * Disbursement Script - Run when student claims points
- * Uses stored grant info to finalize and create outgoing payment
+ * Disbursement - Uses stored authorized grant
  */
-
 import {
   createAuthenticatedClient,
   OpenPaymentsClientError,
@@ -15,8 +13,11 @@ export async function processDisbursement(config) {
     keyId,
     clientWalletAddressUrl,
     sendingWalletAddressUrl,
+    studentWalletAddressUrl,
+    amount,
     continueUri,
-    continueAccessToken
+    continueAccessToken,
+    interact_ref  // NEW - from callback
   } = config
 
   const client = await createAuthenticatedClient({
@@ -25,64 +26,129 @@ export async function processDisbursement(config) {
     privateKey: privateKeyPath
   })
 
-  console.log('✓ Got sending wallet address')
+  console.log('🎯 Starting disbursement')
+  console.log('   Amount: $' + (amount / 100).toFixed(2))
 
-  // Step 7: Continue the grant (finalize it)
-  let finalizedOutgoingPaymentGrant
-
-  try {
-    console.log('🔄 Continuing grant...')
-    console.log('   URI:', continueUri)
-    
-    finalizedOutgoingPaymentGrant = await client.grant.continue({
-      url: continueUri,
-      accessToken: continueAccessToken
-    })
-  } catch (err) {
-    console.error('Grant continuation error:', err)
-    
-    if (err instanceof OpenPaymentsClientError) {
-      throw new Error(
-        'Grant continuation failed. The funder authorization may have expired or been already used. Please create a new funding pool.'
-      )
-    }
-    throw err
-  }
-
-  if (!isFinalizedGrant(finalizedOutgoingPaymentGrant)) {
-    throw new Error('Grant is not finalized. Funder must authorize first.')
-  }
-
-  console.log('✓ Finalized outgoing payment grant')
-
-  // Get the wallet address and quote from the finalized grant
+  // Step 1: Get wallet addresses
   const sendingWalletAddress = await client.walletAddress.get({
     url: sendingWalletAddressUrl
   })
-
-  // The quote ID should be in the finalized grant
-  const quoteId = finalizedOutgoingPaymentGrant.access_token.access[0]?.limits?.receiver || null
   
-  if (!quoteId) {
-    console.error('Finalized grant:', finalizedOutgoingPaymentGrant)
-    throw new Error('Quote ID not found in finalized grant')
+  const studentWalletAddress = await client.walletAddress.get({
+    url: studentWalletAddressUrl
+  })
+
+  console.log('✓ Step 1: Got wallet addresses')
+
+  // Step 2: Continue grant WITH interact_ref
+  console.log('🔄 Continuing grant...')
+  
+  const finalizedGrant = await client.grant.continue({
+    url: continueUri,
+    accessToken: continueAccessToken,
+    interact_ref: interact_ref  // CRITICAL - needed for callback-based grants
+  })
+
+  if (!isFinalizedGrant(finalizedGrant)) {
+    throw new Error('Grant not finalized')
   }
 
-  console.log('✓ Got quote ID from grant:', quoteId)
+  console.log('✓ Step 2: Grant finalized')
 
-  // Step 7c: Create outgoing payment
-  const outgoingPayment = await client.outgoingPayment.create(
+  // Step 3: Get incoming payment grant for student
+  const incomingPaymentGrant = await client.grant.request(
+    { url: studentWalletAddress.authServer },
     {
-      url: sendingWalletAddress.resourceServer,
-      accessToken: finalizedOutgoingPaymentGrant.access_token.value
-    },
-    {
-      walletAddress: sendingWalletAddress.id,
-      quoteId: quoteId
+      access_token: {
+        access: [
+          {
+            type: 'incoming-payment',
+            actions: ['read', 'complete', 'create']
+          }
+        ]
+      }
     }
   )
 
-  console.log('✓ Created outgoing payment - funds transferred!')
+  if (!isFinalizedGrant(incomingPaymentGrant)) {
+    throw new Error('Expected finalized incoming payment grant')
+  }
+
+  console.log('✓ Step 3: Got incoming payment grant')
+
+  // Step 4: Create incoming payment
+  const incomingPayment = await client.incomingPayment.create(
+    {
+      url: studentWalletAddress.resourceServer,
+      accessToken: incomingPaymentGrant.access_token.value
+    },
+    {
+      walletAddress: studentWalletAddress.id,
+      incomingAmount: {
+        assetCode: studentWalletAddress.assetCode,
+        assetScale: studentWalletAddress.assetScale,
+        value: amount.toString()
+      },
+      metadata: {
+        description: 'Shabaha learning reward'
+      }
+    }
+  )
+
+  console.log('✓ Step 4: Created incoming payment')
+
+  // Step 5: Get quote grant
+  const quoteGrant = await client.grant.request(
+    { url: sendingWalletAddress.authServer },
+    {
+      access_token: {
+        access: [
+          {
+            type: 'quote',
+            actions: ['create', 'read']
+          }
+        ]
+      }
+    }
+  )
+
+  if (!isFinalizedGrant(quoteGrant)) {
+    throw new Error('Expected finalized quote grant')
+  }
+
+  console.log('✓ Step 5: Got quote grant')
+
+  // Step 6: Create quote
+  const quote = await client.quote.create(
+    {
+      url: sendingWalletAddress.resourceServer,
+      accessToken: quoteGrant.access_token.value
+    },
+    {
+      walletAddress: sendingWalletAddress.id,
+      receiver: incomingPayment.id,
+      method: 'ilp'
+    }
+  )
+
+  console.log('✓ Step 6: Created quote')
+
+  // Step 7: Create outgoing payment with finalized grant
+  const outgoingPayment = await client.outgoingPayment.create(
+    {
+      url: sendingWalletAddress.resourceServer,
+      accessToken: finalizedGrant.access_token.value
+    },
+    {
+      walletAddress: sendingWalletAddress.id,
+      quoteId: quote.id,
+      metadata: {
+        description: 'Shabaha disbursement'
+      }
+    }
+  )
+
+  console.log('✅ Step 7: Payment complete!')
 
   return {
     status: 'success',
@@ -90,33 +156,4 @@ export async function processDisbursement(config) {
     outgoingPaymentId: outgoingPayment.id,
     message: 'Payment completed successfully'
   }
-}
-
-// If running directly (not imported)
-if (import.meta.url === `file://${process.argv[1]}`) {
-  (async () => {
-    try {
-      // These values would come from WordPress database
-      const config = {
-        privateKeyPath: 'general-test-private.key',
-        keyId: 'b4fe7d1d-76bc-4290-b280-eba1f3021b9f',
-        clientWalletAddressUrl: 'https://ilp.interledger-test.dev/388aba51',
-        sendingWalletAddressUrl: 'https://ilp.interledger-test.dev/388aba51',
-        
-        // These come from fund-wallet.js result stored in DB
-        continueUri: 'PASTE_CONTINUE_URI_HERE',
-        continueAccessToken: 'PASTE_CONTINUE_ACCESS_TOKEN_HERE',
-        quoteId: 'PASTE_QUOTE_ID_HERE',
-        incomingPaymentId: 'PASTE_INCOMING_PAYMENT_ID_HERE'
-      }
-
-      const result = await processDisbursement(config)
-      console.log('\n✅ DISBURSEMENT COMPLETE:')
-      console.log(JSON.stringify(result, null, 2))
-      
-    } catch (error) {
-      console.error('❌ Error:', error.message)
-      process.exit(1)
-    }
-  })()
 }
